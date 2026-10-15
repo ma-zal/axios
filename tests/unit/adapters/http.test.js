@@ -1,4 +1,4 @@
-import { describe, it } from 'vitest';
+import { describe, it, vi } from 'vitest';
 import assert from 'assert';
 import {
   startHTTPServer,
@@ -1702,6 +1702,185 @@ describe('supports http with nodejs', () => {
     } finally {
       await stopHTTPServer(server);
     }
+  });
+
+  describe('buffered response allocation', () => {
+    // `Buffer.concat()` calls that join a chunk list of the given total size - i.e. the join of a
+    // whole response body, as opposed to the small concatenations other code may do meanwhile.
+    const bodyJoins = (spy, size) =>
+      spy.mock.calls.filter(
+        ([list]) =>
+          Array.isArray(list) &&
+          list.length > 1 &&
+          list.reduce((total, chunk) => total + chunk.length, 0) === size
+      );
+
+    // A transport whose response declares whatever headers the test needs, regardless of the body
+    // it then streams - something a real server (and Node's HTTP parser) would not let through.
+    const stubTransport = (headers, chunks, statusCode = 200) => ({
+      request(options, handleResponse) {
+        const req = new EventEmitter();
+        req.write = () => true;
+        req.setTimeout = () => {};
+        req.destroy = () => {};
+        req.end = () => {
+          const res = new stream.Readable({ read() {} });
+          res.statusCode = statusCode;
+          res.statusMessage = 'OK';
+          res.headers = headers;
+          res.rawHeaders = [];
+          res.req = req;
+          process.nextTick(() => {
+            handleResponse(res);
+            for (const chunk of chunks) {
+              res.push(Buffer.from(chunk));
+            }
+            res.push(null);
+          });
+        };
+        return req;
+      },
+    });
+
+    it('should write a response of declared length into one buffer instead of joining chunks', async () => {
+      const chunk = Buffer.alloc(64 * 1024, 0x61);
+      const chunkCount = 8;
+      const body = Buffer.concat(Array(chunkCount).fill(chunk));
+      const server = await startHTTPServer((req, res) => {
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Content-Length', String(body.length));
+        let sent = 0;
+        const write = () => {
+          while (sent < chunkCount) {
+            sent++;
+            if (!res.write(chunk)) {
+              res.once('drain', write);
+              return;
+            }
+          }
+          res.end();
+        };
+        write();
+      });
+      const concatSpy = vi.spyOn(Buffer, 'concat');
+
+      try {
+        const response = await axios.get(`http://localhost:${server.address().port}/`, {
+          responseType: 'arraybuffer',
+          maxRedirects: 0,
+        });
+
+        assert.ok(Buffer.isBuffer(response.data));
+        assert.strictEqual(response.data.length, body.length);
+        assert.ok(response.data.equals(body));
+        assert.strictEqual(bodyJoins(concatSpy, body.length).length, 0);
+      } finally {
+        concatSpy.mockRestore();
+        await stopHTTPServer(server);
+      }
+    });
+
+    it('should still join chunks when the response declares no length', async () => {
+      const chunk = Buffer.alloc(64 * 1024, 0x62);
+      const chunkCount = 8;
+      const body = Buffer.concat(Array(chunkCount).fill(chunk));
+      const server = await startHTTPServer((req, res) => {
+        res.setHeader('Content-Type', 'application/octet-stream');
+        // no Content-Length: chunked transfer encoding
+        let sent = 0;
+        const write = () => {
+          while (sent < chunkCount) {
+            sent++;
+            if (!res.write(chunk)) {
+              res.once('drain', write);
+              return;
+            }
+          }
+          res.end();
+        };
+        write();
+      });
+      const concatSpy = vi.spyOn(Buffer, 'concat');
+
+      try {
+        const response = await axios.get(`http://localhost:${server.address().port}/`, {
+          responseType: 'arraybuffer',
+          maxRedirects: 0,
+        });
+
+        assert.ok(response.data.equals(body));
+        assert.strictEqual(bodyJoins(concatSpy, body.length).length, 1);
+      } finally {
+        concatSpy.mockRestore();
+        await stopHTTPServer(server);
+      }
+    });
+
+    it('should return the whole body when it is longer than the declared length', async () => {
+      const response = await axios.get('http://stub.invalid/', {
+        transport: stubTransport({ 'content-length': '5' }, ['hello', ' ', 'world']),
+        responseType: 'arraybuffer',
+        maxRedirects: 0,
+      });
+
+      assert.strictEqual(response.data.toString(), 'hello world');
+    });
+
+    it('should trim the body when it is shorter than the declared length', async () => {
+      const response = await axios.get('http://stub.invalid/', {
+        transport: stubTransport({ 'content-length': '1000' }, ['hel', 'lo']),
+        responseType: 'arraybuffer',
+        maxRedirects: 0,
+      });
+
+      assert.strictEqual(response.data.length, 5);
+      assert.strictEqual(response.data.toString(), 'hello');
+    });
+
+    it('should decode a text response that is shorter than the declared length', async () => {
+      const response = await axios.get('http://stub.invalid/', {
+        transport: stubTransport({ 'content-length': '1000' }, ['{"ok":', 'true}']),
+        maxRedirects: 0,
+      });
+
+      assert.deepStrictEqual(response.data, { ok: true });
+    });
+
+    it('should not allocate a body for a HEAD response that declares one', async () => {
+      const response = await axios.head('http://stub.invalid/', {
+        transport: stubTransport({ 'content-length': String(1024 * 1024 * 1024) }, []),
+        responseType: 'arraybuffer',
+        maxRedirects: 0,
+      });
+
+      assert.strictEqual(response.data.length, 0);
+    });
+
+    it('should enforce maxContentLength on a body longer than its declared length', async () => {
+      await assert.rejects(
+        axios.get('http://stub.invalid/', {
+          transport: stubTransport({ 'content-length': '5' }, ['hello', ' ', 'world']),
+          responseType: 'arraybuffer',
+          maxContentLength: 8,
+          maxRedirects: 0,
+        }),
+        (error) => {
+          assert.strictEqual(error.code, AxiosError.ERR_BAD_RESPONSE);
+          assert.strictEqual(error.message, 'maxContentLength size of 8 exceeded');
+          return true;
+        }
+      );
+    });
+
+    it('should not pre-allocate a declared length the runtime cannot allocate', async () => {
+      const response = await axios.get('http://stub.invalid/', {
+        transport: stubTransport({ 'content-length': String(Number.MAX_SAFE_INTEGER) }, ['ok']),
+        responseType: 'arraybuffer',
+        maxRedirects: 0,
+      });
+
+      assert.strictEqual(response.data.toString(), 'ok');
+    });
   });
 
   it('should support max body length', async () => {
